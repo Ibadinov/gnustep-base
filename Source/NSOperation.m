@@ -460,7 +460,9 @@ static NSRecursiveLock *dependencyLock = nil;
   NS_HANDLER
     {
       [internal->lock unlock];
-      [localException raise];
+      [localException retain];
+      [pool release];
+      [[localException autorelease] raise];
     }
   NS_ENDHANDLER
   [internal->lock unlock];
@@ -476,10 +478,13 @@ static NSRecursiveLock *dependencyLock = nil;
   NS_HANDLER
     {
       [NSThread setThreadPriority:  prio];
-      [localException raise];
+      [localException retain];
+      [pool release];
+      [[localException autorelease] raise];
     }
   NS_ENDHANDLER;
 
+  [NSThread setThreadPriority:  prio];
   [self _finish];
   [pool release];
 }
@@ -970,19 +975,13 @@ static NSOperationQueue *mainQueue = nil;
 	{
           NS_DURING
 	    {
-	      if (NO == [op isCancelled])
-		{
-		  [NSThread setThreadPriority: [op threadPriority]];
-		  [op main];
-		}
+              [op start];
 	    }
           NS_HANDLER
 	    {
-	      NSLog(@"Problem running operation %@ ... %@",
-		op, localException);
+	      NSLog(@"Problem running operation %@ ... %@", op, localException);
 	    }
           NS_ENDHANDLER
-	  [op _finish];
 	}
       [opPool release];
     }
