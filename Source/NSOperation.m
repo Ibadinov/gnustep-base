@@ -78,10 +78,6 @@ GS_PRIVATE_INTERNAL(NSOperation)
 static NSArray	*empty = nil;
 static NSRecursiveLock *dependencyLock = nil;
 
-@interface	NSOperation (Private)
-- (void) _finish;
-@end
-
 @implementation NSOperation
 
 + (BOOL) automaticallyNotifiesObserversForKey: (NSString*)theKey
@@ -420,8 +416,7 @@ static NSRecursiveLock *dependencyLock = nil;
 
 - (void) start
 {
-  NSAutoreleasePool	*pool = [NSAutoreleasePool new];
-  double		prio = [NSThread  threadPriority];
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
 
   [internal->lock lock];
   NS_DURING
@@ -450,12 +445,6 @@ static NSRecursiveLock *dependencyLock = nil;
 		      format: @"[%@-%@] called on operation which is not ready",
 	    NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
 	}
-      if (NO == internal->executing)
-	{
-	  [self willChangeValueForKey: @"isExecuting"];
-	  internal->executing = YES;
-	  [self didChangeValueForKey: @"isExecuting"];
-	}
     }
   NS_HANDLER
     {
@@ -467,25 +456,65 @@ static NSRecursiveLock *dependencyLock = nil;
   NS_ENDHANDLER
   [internal->lock unlock];
 
+  double previousPriority = [NSThread threadPriority];
+
   NS_DURING
     {
-      if (NO == [self isCancelled])
-	{
-	  [NSThread setThreadPriority: internal->threadPriority];
-	  [self main];
-	}
+      BOOL isCancelled = [self isCancelled];
+      if (!isCancelled)
+        {
+          [self willChangeValueForKey: @"isExecuting"];
+          [internal->lock lock];
+          internal->executing = YES;
+          [internal->lock unlock];
+          [self didChangeValueForKey: @"isExecuting"];
+
+          [NSThread setThreadPriority: internal->threadPriority];
+          [self main];
+        }
+
+      /*
+       * retain while finishing so that we don't get deallocated when our
+       * queue removes and releases us.
+       */
+      [self retain];
+
+      [self willChangeValueForKey: @"isFinished"];
+      if (!isCancelled)
+        {
+          [self willChangeValueForKey: @"isExecuting"];
+          [internal->lock lock];
+          internal->executing = NO;
+          [internal->lock unlock];
+          [self didChangeValueForKey: @"isExecuting"];
+        }
+      [dependencyLock lock];
+      [internal->lock lock];
+      internal->finished = YES;
+      [internal->lock unlock];
+      [dependencyLock unlock];
+      [self didChangeValueForKey: @"isFinished"];
+
+      [internal->lock lock];
+      GSOperationCompletionBlock completionBlock = internal->completionBlock;
+      [internal->lock unlock];
+      if (NULL != completionBlock)
+        {
+          CALL_BLOCK_NO_ARGS(completionBlock);
+        }
+
+      [self release];
     }
   NS_HANDLER
     {
-      [NSThread setThreadPriority:  prio];
+      [NSThread setThreadPriority: previousPriority];
       [localException retain];
       [pool release];
       [[localException autorelease] raise];
     }
   NS_ENDHANDLER;
 
-  [NSThread setThreadPriority:  prio];
-  [self _finish];
+  [NSThread setThreadPriority: previousPriority];
   [pool release];
 }
 
@@ -526,43 +555,6 @@ static NSRecursiveLock *dependencyLock = nil;
 }
 @end
 
-@implementation	NSOperation (Private)
-- (void) _finish
-{
-  /* retain while finishing so that we don't get deallocated when our
-   * queue removes and releases us.
-   */
-  [self retain];
-  [dependencyLock lock];
-  [internal->lock lock];
-  if (NO == internal->finished)
-    {
-      if (NO == internal->executing)
-        {
-	  [self willChangeValueForKey: @"isExecuting"];
-	  [self willChangeValueForKey: @"isFinished"];
-	  internal->executing = NO;
-	  internal->finished = YES;
-	  [self didChangeValueForKey: @"isFinished"];
-	  [self didChangeValueForKey: @"isExecuting"];
-	}
-      else
-	{
-	  [self willChangeValueForKey: @"isFinished"];
-	  internal->finished = YES;
-	  [self didChangeValueForKey: @"isFinished"];
-	}
-      if (NULL != internal->completionBlock)
-	{
-	  CALL_BLOCK_NO_ARGS(internal->completionBlock);
-	}
-    }
-  [internal->lock unlock];
-  [dependencyLock unlock];
-  [self release];
-}
-
-@end
 
 #undef	GSInternal
 #define	GSInternal	NSOperationQueueInternal
