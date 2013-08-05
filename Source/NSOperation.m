@@ -66,6 +66,7 @@
 #import "Foundation/NSThread.h"
 #import "GSPrivate.h"
 #import "GNUstepBase/NSObject+GNUstepBase.h"
+#import "GNUstepBase/NSString+GNUstepBase.h"
 
 #define	GSInternal	NSOperationInternal
 #include	"GSInternal.h"
@@ -75,122 +76,85 @@ GS_PRIVATE_INTERNAL(NSOperation)
  */
 #define	POOL	8
 
-static NSArray	*empty = nil;
-static NSRecursiveLock *dependencyLock = nil;
+static NSArray *empty = nil;
+
+static void GSAssertionFailure(id self, SEL _cmd, NSString *format, ...) NS_FORMAT_FUNCTION(3, 4);
+static void GSAssertionFailure(id self, SEL _cmd, NSString *format, ...)
+{
+  va_list arguments;
+  va_start(arguments, format);
+  NSString *description = [NSString stringWithFormat:format arguments:arguments];
+  va_end(arguments);
+
+  char modifier = class_isMetaClass(object_getClass(self)) ? '+' : '-';
+  [NSException raise:NSInvalidArgumentException format:@"*** %c[%@ %@]: %@", modifier, NSStringFromClass([self class]), NSStringFromSelector(_cmd), description];
+}
+
+#define GSParameterAssert(condition, format, ...)               \
+do {                                                            \
+    if (__builtin_expect(!(condition), NO)) {                   \
+        GSAssertionFailure(self, _cmd, format, ##__VA_ARGS__);  \
+    }                                                           \
+} while(0)
 
 @implementation NSOperation
 
 + (BOOL) automaticallyNotifiesObserversForKey: (NSString*)theKey
 {
-  /* Handle all KVO manually
-   */
-  return NO;
+  return NO; /* Handle all KVO manually */
 }
 
 + (void) initialize
 {
     if (!empty) {
         empty = [NSObject leakRetained:[NSArray new]];
-        dependencyLock = [NSObject leakRetained:[NSRecursiveLock new]];
     }
 }
 
 - (void) addDependency: (NSOperation *)op
 {
-  if (NO == [op isKindOfClass: [NSOperation class]])
-    {
-      [NSException raise: NSInvalidArgumentException
-		  format: @"[%@-%@] dependency is not an NSOperation",
-	NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    }
-  if (op == self)
-    {
-      [NSException raise: NSInvalidArgumentException
-		  format: @"[%@-%@] attempt to add dependency on self",
-	NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    }
-  [dependencyLock lock];
+  GSParameterAssert(op != self, @"attempt to add dependency on self");
+  GSParameterAssert([op isKindOfClass:[NSOperation class]], @"dependency is not an NSOperation");
+
+  [self willChangeValueForKey:@"dependencies"];
+  [self willChangeValueForKey:@"isReady"];
+
   [internal->lock lock];
   if (internal->dependencies == nil)
     {
-      internal->dependencies = [[NSMutableArray alloc] initWithCapacity: 5];
+      internal->dependencies = [[NSMutableArray alloc] initWithCapacity:5];
     }
-  NS_DURING
+  BOOL isNew = NSNotFound == [internal->dependencies indexOfObjectIdenticalTo:op];
+  if (isNew)
     {
-      if (NSNotFound == [internal->dependencies indexOfObjectIdenticalTo: op])
-	{
-	  [self willChangeValueForKey: @"dependencies"];
-          [internal->dependencies addObject: op];
-	  /* We only need to watch for changes if it's possible for them to
-	   * happen and make a difference.
-	   */
-	  if (NO == [op isFinished]
-	    && NO == [self isCancelled]
-	    && NO == [self isExecuting]
-	    && NO == [self isFinished])
-	    {
-	      /* Can change readiness if we are neither cancelled nor
-	       * executing nor finished.  So we need to observe for the
-	       * finish of the dependency.
-	       */
-	      [op addObserver: self
-		   forKeyPath: @"isFinished"
-		      options: NSKeyValueObservingOptionNew
-		      context: NULL];
-	      if (internal->ready == YES)
-		{
-		  /* The new dependency stops us being ready ...
-		   * change state.
-		   */
-		  [self willChangeValueForKey: @"isReady"];
-		  internal->ready = NO;
-		  [self didChangeValueForKey: @"isReady"];
-		}
-	    }
-	  [self didChangeValueForKey: @"dependencies"];
-	}
+      [internal->dependencies addObject:op];
+      internal->ready = NO;
     }
-  NS_HANDLER
-    {
-      [internal->lock unlock];
-      [dependencyLock unlock];
-      NSLog(@"Problem adding dependency: %@", localException);
-      return;
-    }
-  NS_ENDHANDLER
   [internal->lock unlock];
-  [dependencyLock unlock];
+
+  if (isNew)
+    {
+      NSUInteger options = NSKeyValueObservingOptionNew | NSKeyValueObservingOptionInitial;
+      [op addObserver:self forKeyPath:@"isFinished" options:options context:NULL];
+    }
+
+  [self didChangeValueForKey:@"isReady"];
+  [self didChangeValueForKey:@"dependencies"];
 }
 
 - (void) cancel
 {
-  if (NO == internal->cancelled && NO == [self isFinished])
-    {
-      [internal->lock lock];
-      if (NO == internal->cancelled && NO == [self isFinished])
-	{
-	  NS_DURING
-	    {
-	      [self willChangeValueForKey: @"isCancelled"];
-	      internal->cancelled = YES;
-	      if (NO == internal->ready)
-		{
-	          [self willChangeValueForKey: @"isReady"];
-		  internal->ready = YES;
-	          [self didChangeValueForKey: @"isReady"];
-		}
-	      [self didChangeValueForKey: @"isCancelled"];
-	    }
-	  NS_HANDLER
-	    {
-	      [internal->lock unlock];
-	      NSLog(@"Problem cancelling operation: %@", localException);
-	      return;
-	    }
-	  NS_ENDHANDLER
-	}
-      [internal->lock unlock];
-    }
+  [self willChangeValueForKey:@"isCancelled"];
+  [internal->lock lock];
+  internal->cancelled = YES;
+  [internal->lock unlock];
+  [self didChangeValueForKey:@"isCancelled"];
+
+  [self willChangeValueForKey:@"isReady"];
+  [internal->lock lock];
+  internal->ready = YES;
+  [internal->lock unlock];
+  [self didChangeValueForKey:@"isReady"];
 }
 
 - (GSOperationCompletionBlock) completionBlock
@@ -218,19 +182,19 @@ static NSRecursiveLock *dependencyLock = nil;
 
 - (NSArray *) dependencies
 {
-  NSArray	*a;
+  NSArray *dependencies;
 
+  [internal->lock lock];
   if (internal->dependencies == nil)
     {
-      a = empty;	// OSX return an empty array
+      dependencies = empty; /* OSX returns an empty array */
     }
   else
     {
-      [internal->lock lock];
-      a = [NSArray arrayWithArray: internal->dependencies];
-      [internal->lock unlock];
+      dependencies = [NSArray arrayWithArray:internal->dependencies];
     }
-  return a;
+  [internal->lock unlock];
+  return dependencies;
 }
 
 - (id) init
@@ -248,32 +212,91 @@ static NSRecursiveLock *dependencyLock = nil;
 
 - (BOOL) isCancelled
 {
-  return internal->cancelled;
+  [internal->lock lock];
+  BOOL result = internal->cancelled;
+  [internal->lock unlock];
+  return result;
 }
 
 - (BOOL) isExecuting
 {
-  return internal->executing;
+  [internal->lock lock];
+  BOOL result = internal->executing;
+  [internal->lock unlock];
+  return result;
 }
 
 - (BOOL) isFinished
 {
-  return internal->finished;
+  [internal->lock lock];
+  BOOL result = internal->finished;
+  [internal->lock unlock];
+  return result;
 }
 
 - (BOOL) isConcurrent
 {
-  return internal->concurrent;
+  [internal->lock lock];
+  BOOL result = internal->concurrent;
+  [internal->lock unlock];
+  return result;
 }
 
 - (BOOL) isReady
 {
-  return internal->ready;
+  [internal->lock lock];
+  BOOL result = internal->ready;
+  [internal->lock unlock];
+  return result;
+}
+
+- (NSOperationQueuePriority) queuePriority
+{
+  [internal->lock lock];
+  NSOperationQueuePriority result = internal->priority;
+  [internal->lock unlock];
+  return result;
+}
+
+- (double) threadPriority
+{
+  [internal->lock lock];
+  double result = internal->threadPriority;
+  [internal->lock unlock];
+  return result;
 }
 
 - (void) main;
 {
-  return;	// OSX default implementation does nothing
+  return; /* OSX default implementation does nothing */
+}
+
+- (void) _checkIfReady
+{
+  /* Some dependency has finished (or been removed) ...
+   * so we need to check to see if we are now ready unless we know we are.
+   * This is protected by locks so that an update due to an observed
+   * change in one thread won't interrupt anything in another thread.
+   */
+  [internal->lock lock];
+  NSEnumerator *en = [internal->dependencies objectEnumerator];
+  NSOperation	*op;
+  while ((op = [en nextObject]) != nil)
+    {
+      if (NO == [op isFinished])
+        {
+          break;
+        }
+    }
+  [internal->lock unlock];
+  if (op == nil)
+    {
+      [self willChangeValueForKey: @"isReady"];
+      [internal->lock lock];
+      internal->ready = YES;
+      [internal->lock unlock];
+      [self didChangeValueForKey: @"isReady"];
+    }
 }
 
 - (void) observeValueForKeyPath: (NSString *)keyPath
@@ -281,94 +304,48 @@ static NSRecursiveLock *dependencyLock = nil;
                          change: (NSDictionary *)change
                         context: (void *)context
 {
-  [internal->lock lock];
-
-  /* We only observe isFinished changes, and we can remove self as an
-   * observer once we know the operation has finished since it can never
-   * become unfinished.
-   */
-  [object removeObserver: self
-	      forKeyPath: @"isFinished"];
-
-  if (object == self)
+  if ([[change objectForKey:NSKeyValueChangeNewKey] boolValue])
     {
-      /* We have finished and need to unlock the condition lock so that
-       * any waiting thread can continue.
-       */
-      [internal->cond lock];
-      [internal->cond unlockWithCondition: 1];
-    }
-  else if (NO == internal->ready)
-    {
-      NSEnumerator	*en;
-      NSOperation	*op;
+      /* NSOperation observes isFinished key only */
+      [object removeObserver:self forKeyPath:keyPath];
 
-      /* Some dependency has finished (or been removed) ...
-       * so we need to check to see if we are now ready unless we know we are.
-       * This is protected by locks so that an update due to an observed
-       * change in one thread won't interrupt anything in another thread.
-       */
-      en = [internal->dependencies objectEnumerator];
-      while ((op = [en nextObject]) != nil)
+      if (object == self)
         {
-          if (NO == [op isFinished])
-	    break;
+          /*
+           * We have finished and need to unlock the condition lock so that
+           * any waiting thread can continue
+           */
+          [internal->cond lock];
+          [internal->cond unlockWithCondition: 1];
         }
-      if (op == nil)
-	{
-          [self willChangeValueForKey: @"isReady"];
-	  internal->ready = YES;
-          [self didChangeValueForKey: @"isReady"];
-	}
+      else
+        {
+          [self _checkIfReady];
+        }
     }
-  [internal->lock unlock];
-}
-
-- (NSOperationQueuePriority) queuePriority
-{
-  return internal->priority;
 }
 
 - (void) removeDependency: (NSOperation *)op
 {
-  [dependencyLock lock];
-  [internal->lock lock];
-  NS_DURING
+    [self willChangeValueForKey:@"dependencies"];
+    
+    [internal->lock lock];
+    if (NSNotFound != [internal->dependencies indexOfObjectIdenticalTo:op])
     {
-      if (NSNotFound != [internal->dependencies indexOfObjectIdenticalTo: op])
-	{
-	  [op removeObserver: self
-	          forKeyPath: @"isFinished"];
-	  [self willChangeValueForKey: @"dependencies"];
-	  [internal->dependencies removeObject: op];
-	  if (NO == internal->ready)
-	    {
-	      /* The dependency may cause us to become ready ...
-	       * fake an observation so we can deal with that.
-	       */
-	      [self observeValueForKeyPath: @"isFinished"
-				  ofObject: op
-				    change: nil
-				   context: nil];
-	    }
-	  [self didChangeValueForKey: @"dependencies"];
-	}
+        [op removeObserver:self forKeyPath:@"isFinished"];
+        [internal->dependencies removeObject:op];
     }
-  NS_HANDLER
-    {
-      [internal->lock unlock];
-      [dependencyLock unlock];
-      NSLog(@"Problem removing dependency: %@", localException);
-      return;
-    }
-  NS_ENDHANDLER
-  [internal->lock unlock];
-  [dependencyLock unlock];
+    [internal->lock unlock];
+    [self _checkIfReady];
+    
+    [self didChangeValueForKey:@"dependencies"];
 }
 
 - (void) setCompletionBlock: (GSOperationCompletionBlock)aBlock
 {
+  [internal->lock lock];
   internal->completionBlock = aBlock;
+  [internal->lock unlock];
 }
 
 - (void) setQueuePriority: (NSOperationQueuePriority)pri
@@ -384,34 +361,19 @@ static NSRecursiveLock *dependencyLock = nil;
   else
     pri = NSOperationQueuePriorityVeryHigh;
 
-  if (pri != internal->priority)
-    {
-      [internal->lock lock];
-      if (pri != internal->priority)
-	{
-	  NS_DURING
-	    {
-	      [self willChangeValueForKey: @"queuePriority"];
-	      internal->priority = pri;
-	      [self didChangeValueForKey: @"queuePriority"];
-	    }
-	  NS_HANDLER
-	    {
-	      [internal->lock unlock];
-	      NSLog(@"Problem setting priority: %@", localException);
-	      return;
-	    }
-	  NS_ENDHANDLER
-	}
-      [internal->lock unlock];
-    }
+  [self willChangeValueForKey: @"queuePriority"];
+  [internal->lock lock];
+  internal->priority = pri;
+  [internal->lock unlock];
+  [self didChangeValueForKey: @"queuePriority"];
 }
 
 - (void) setThreadPriority: (double)pri
 {
-  if (pri > 1) pri = 1;
-  else if (pri < 0) pri = 0;
+  pri = pri < 0 ? 0 : (pri > 1 ? 1 : pri);
+  [internal->lock lock];
   internal->threadPriority = pri;
+  [internal->lock unlock];
 }
 
 - (void) start
@@ -421,30 +383,10 @@ static NSRecursiveLock *dependencyLock = nil;
   [internal->lock lock];
   NS_DURING
     {
-      if (YES == [self isConcurrent])
-	{
-	  [NSException raise: NSInvalidArgumentException
-		      format: @"[%@-%@] called on concurrent operation",
-	    NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-	}
-      if (YES == [self isExecuting])
-	{
-	  [NSException raise: NSInvalidArgumentException
-		      format: @"[%@-%@] called on executing operation",
-	    NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-	}
-      if (YES == [self isFinished])
-	{
-	  [NSException raise: NSInvalidArgumentException
-		      format: @"[%@-%@] called on finished operation",
-	    NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-	}
-      if (NO == [self isReady])
-	{
-	  [NSException raise: NSInvalidArgumentException
-		      format: @"[%@-%@] called on operation which is not ready",
-	    NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-	}
+      GSParameterAssert(![self isConcurrent], @"called on concurrent operation");
+      GSParameterAssert(![self isExecuting], @"called on executing operation");
+      GSParameterAssert(![self isFinished], @"called on executing operation");
+      GSParameterAssert([self isReady], @"called on operation which is not ready");
     }
   NS_HANDLER
     {
@@ -485,14 +427,16 @@ static NSRecursiveLock *dependencyLock = nil;
           [self willChangeValueForKey: @"isExecuting"];
           [internal->lock lock];
           internal->executing = NO;
+          internal->finished = YES;
           [internal->lock unlock];
           [self didChangeValueForKey: @"isExecuting"];
         }
-      [dependencyLock lock];
-      [internal->lock lock];
-      internal->finished = YES;
-      [internal->lock unlock];
-      [dependencyLock unlock];
+      else
+        {
+          [internal->lock lock];
+          internal->finished = YES;
+          [internal->lock unlock];
+        }
       [self didChangeValueForKey: @"isFinished"];
 
       [internal->lock lock];
@@ -518,41 +462,22 @@ static NSRecursiveLock *dependencyLock = nil;
   [pool release];
 }
 
-- (double) threadPriority
-{
-  return internal->threadPriority;
-}
-
 - (void) waitUntilFinished
 {
-  if (NO == [self isFinished])
+  [internal->lock lock];
+  if (internal->cond == nil)
     {
-      [internal->lock lock];
-      if (nil == internal->cond)
-	{
-	  /* Set up condition to wait on and observer to unblock.
-	   */
-	  internal->cond = [[NSConditionLock alloc] initWithCondition: 0];
-	  [self addObserver: self
-		 forKeyPath: @"isFinished"
-		    options: NSKeyValueObservingOptionNew
-		    context: NULL];
-	  /* Some other thread could have marked us as finished while we
-	   * were setting up ... so we can fake the observation if needed.
-	   */
-          if (YES == [self isFinished])
-	    {
-	      [self observeValueForKeyPath: @"isFinished"
-				  ofObject: self
-				    change: nil
-				   context: nil];
-	    }
-	}
-      [internal->lock unlock];
-      [internal->cond lockWhenCondition: 1];	// Wait for finish
-      [internal->cond unlockWithCondition: 1];	// Signal any other watchers
+      /* set up condition to wait on and observer to unblock */
+      internal->cond = [[NSConditionLock alloc] initWithCondition: 0];
     }
+  [internal->lock unlock];
+
+  [self addObserver:self forKeyPath:@"isFinished" options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionInitial context:NULL];
+
+  [internal->cond lockWhenCondition:1]; /* wait until finished */
+  [internal->cond unlockWithCondition:1]; /* signal other threads */
 }
+
 @end
 
 
@@ -585,8 +510,10 @@ sortFunc(id o1, id o2, void *ctxt)
   return NSOrderedSame;
 }
 
+
 static NSString	*threadKey = @"NSOperationQueue";
 static NSOperationQueue *mainQueue = nil;
+
 
 @implementation NSOperationQueue
 
@@ -612,132 +539,43 @@ static NSOperationQueue *mainQueue = nil;
 
 - (void) addOperation: (NSOperation *)op
 {
-  if (op == nil || NO == [op isKindOfClass: [NSOperation class]])
-    {
-      [NSException raise: NSInvalidArgumentException
-		  format: @"[%@-%@] object is not an NSOperation",
-	NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
-    }
-  [dependencyLock lock];
+  GSParameterAssert([op isKindOfClass:[NSOperation class]], @"object is not an NSOperation");
+  GSParameterAssert(![op isExecuting], @"operation is executing and cannot be enqueued");
+  GSParameterAssert(![op isFinished], @"operation is finished and cannot be enqueued");
+
+  [self willChangeValueForKey:@"operations"];
+  [self willChangeValueForKey:@"operationCount"];
+
   [internal->lock lock];
-  if (NSNotFound == [internal->operations indexOfObjectIdenticalTo: op]
-    && NO == [op isFinished])
+  if (NSNotFound == [internal->operations indexOfObjectIdenticalTo:op])
     {
-      [op addObserver: self
-	   forKeyPath: @"isReady"
-	      options: NSKeyValueObservingOptionNew
-	      context: NULL];
-      [self willChangeValueForKey: @"operations"];
-      [self willChangeValueForKey: @"operationCount"];
-      [internal->operations addObject: op];
-      [self didChangeValueForKey: @"operationCount"];
-      [self didChangeValueForKey: @"operations"];
-      if (YES == [op isReady])
-	{
-	  [self observeValueForKeyPath: @"isReady"
-			      ofObject: op
-				change: nil
-			       context: nil];
-	}
+      [internal->operations addObject:op];
     }
   [internal->lock unlock];
-  [dependencyLock unlock];
+  [op addObserver:self forKeyPath:@"isReady" options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionInitial context:NULL];
+
+  [self didChangeValueForKey:@"operationCount"];
+  [self didChangeValueForKey:@"operations"];
 }
 
-- (void) addOperations: (NSArray *)ops
-     waitUntilFinished: (BOOL)shouldWait
+- (void)addOperations:(NSArray *)operations waitUntilFinished:(BOOL)shouldWait
 {
-  NSUInteger	total;
-  NSUInteger	index;
+  GSParameterAssert([operations isKindOfClass:[NSArray class]], @"object is not an NSArray");
 
-  if (ops == nil || NO == [ops isKindOfClass: [NSArray class]])
+  NSUInteger count = [operations count];
+  for (NSUInteger index = 0; index < count; ++index)
     {
-      [NSException raise: NSInvalidArgumentException
-		  format: @"[%@-%@] object is not an NSArray",
-	NSStringFromClass([self class]), NSStringFromSelector(_cmd)];
+      NSOperation *operation = [operations objectAtIndex:index];
+      [self addOperation:operation];
     }
-  total = [ops count];
-  if (total > 0)
+
+  if (shouldWait)
     {
-      BOOL		invalidArg = NO;
-      NSUInteger	toAdd = total;
-      GS_BEGINITEMBUF(buf, total, id)
-
-      [ops getObjects: buf];
-      for (index = 0; index < total; index++)
-	{
-	  NSOperation	*op = buf[index];
-
-	  if (NO == [op isKindOfClass: [NSOperation class]])
-	    {
-	      invalidArg = YES;
-	      toAdd = 0;
-	      break;
-	    }
-	  if (YES == [op isFinished])
-	    {
-	      buf[index] = nil;
-	      toAdd--;
-	    }
-	}
-      if (toAdd > 0)
-	{
-          [internal->lock lock];
-	  [self willChangeValueForKey: @"operationCount"];
-	  [self willChangeValueForKey: @"operations"];
-	  for (index = 0; index < total; index++)
-	    {
-	      NSOperation	*op = buf[index];
-
-	      if (op == nil)
-		{
-		  continue;		// Not added
-		}
-	      if (NSNotFound
-		!= [internal->operations indexOfObjectIdenticalTo: op])
-		{
-		  buf[index] = nil;	// Not added
-		  toAdd--;
-		  continue;
-		}
-	      [op addObserver: self
-		   forKeyPath: @"isReady"
-		      options: NSKeyValueObservingOptionNew
-		      context: NULL];
-	      [internal->operations addObject: op];
-	      if (NO == [op isReady])
-		{
-		  buf[index] = nil;	// Not yet ready
-		}
-	    }
-	  [self didChangeValueForKey: @"operationCount"];
-	  [self didChangeValueForKey: @"operations"];
-	  for (index = 0; index < total; index++)
-	    {
-	      NSOperation	*op = buf[index];
-
-	      if (op != nil)
-		{
-		  [self observeValueForKeyPath: @"isReady"
-				      ofObject: op
-					change: nil
-				       context: nil];
-		}
-	    }
-          [internal->lock unlock];
-	}
-      GS_ENDITEMBUF()
-      if (YES == invalidArg)
-	{
-	  [NSException raise: NSInvalidArgumentException
-	    format: @"[%@-%@] object at index %lu is not an NSOperation",
-	    NSStringFromClass([self class]), NSStringFromSelector(_cmd),
-	    (unsigned long)index];
-	}
-    }
-  if (YES == shouldWait)
-    {
-      [self waitUntilAllOperationsAreFinished];
+      for (NSUInteger index = 0; index < count; ++index)
+        {
+          NSOperation *operation = [operations objectAtIndex:index];
+          [operation waitUntilFinished];
+        }
     }
 }
 
@@ -776,93 +614,84 @@ static NSOperationQueue *mainQueue = nil;
 
 - (BOOL) isSuspended
 {
-  return internal->suspended;
+  [internal->lock lock];
+  BOOL result = internal->suspended;
+  [internal->lock unlock];
+  return result;
 }
 
 - (NSInteger) maxConcurrentOperationCount
 {
-  return internal->count;
+  [internal->lock lock];
+  NSInteger result = internal->count;
+  [internal->lock unlock];
+  return result;
 }
 
 - (NSString*) name
 {
-  NSString	*s;
-
   [internal->lock lock];
   if (internal->name == nil)
     {
-      internal->name
-	= [[NSString alloc] initWithFormat: @"NSOperation %p", self];
+      internal->name = [[NSString alloc] initWithFormat:@"NSOperation %p", self];
     }
-  s = [internal->name retain];
+  NSString *result = [internal->name retain];
   [internal->lock unlock];
-  return [s autorelease];
+  return [result autorelease];
 }
 
 - (NSUInteger) operationCount
 {
-  NSUInteger	c;
-
   [internal->lock lock];
-  c = [internal->operations count];
+  NSUInteger result = [internal->operations count];
   [internal->lock unlock];
-  return c;
+  return result;
 }
 
 - (NSArray *) operations
 {
-  NSArray	*a;
-
   [internal->lock lock];
-  a = [NSArray arrayWithArray: internal->operations];
+  NSArray *result = [NSArray arrayWithArray:internal->operations];
   [internal->lock unlock];
-  return a;
+  return result;
 }
 
-- (void) setMaxConcurrentOperationCount: (NSInteger)cnt
+- (void) setMaxConcurrentOperationCount: (NSInteger)count
 {
-  if (cnt < 0
-    && cnt != NSOperationQueueDefaultMaxConcurrentOperationCount)
-    {
-      [NSException raise: NSInvalidArgumentException
-		  format: @"[%@-%@] cannot set negative (%ld) count",
-	NSStringFromClass([self class]), NSStringFromSelector(_cmd), (long)cnt];
-    }
+  GSParameterAssert(count >= 0 || count == NSOperationQueueDefaultMaxConcurrentOperationCount, @"cannot set negative (%ld) count", count);
+
+  [self willChangeValueForKey:@"maxConcurrentOperationCount"];
   [internal->lock lock];
-  if (cnt != internal->count)
-    {
-      [self willChangeValueForKey: @"maxConcurrentOperationCount"];
-      internal->count = cnt;
-      [self didChangeValueForKey: @"maxConcurrentOperationCount"];
-    }
+  internal->count = count;
   [internal->lock unlock];
+  [self didChangeValueForKey:@"maxConcurrentOperationCount"];
+
   [self _execute];
 }
 
-- (void) setName: (NSString*)s
+- (void) setName: (NSString*)aName
 {
-  if (s == nil) s = @"";
+  aName = aName ? aName : @"";
+
+  [self willChangeValueForKey:@"name"];
   [internal->lock lock];
-  if (NO == [internal->name isEqual: s])
+  if (NO == [internal->name isEqual:aName])
     {
-      [self willChangeValueForKey: @"name"];
       [internal->name release];
-      internal->name = [s copy];
-      [self didChangeValueForKey: @"name"];
+      internal->name = [aName copy];
     }
   [internal->lock unlock];
+  [self didChangeValueForKey:@"name"];
 }
 
-- (void) setSuspended: (BOOL)flag
+- (void) setSuspended: (BOOL)suspend
 {
+  [self willChangeValueForKey:@"suspended"];
   [internal->lock lock];
-  if (flag != internal->suspended)
-    {
-      [self willChangeValueForKey: @"suspended"];
-      internal->suspended = flag;
-      [self didChangeValueForKey: @"suspended"];
-    }
+  internal->suspended = suspend;
   [internal->lock unlock];
+  [self didChangeValueForKey:@"suspended"];
+
   [self _execute];
 }
 
@@ -900,25 +729,37 @@ static NSOperationQueue *mainQueue = nil;
                          change: (NSDictionary *)change
                         context: (void *)context
 {
-  [internal->lock lock];
   if (YES == [object isFinished])
     {
+      [object removeObserver:self forKeyPath:@"isFinished"];
+      [object removeObserver:self forKeyPath:@"isReady"];
+
+      [self willChangeValueForKey:@"operations"];
+      [self willChangeValueForKey:@"operationCount"];
+      [internal->lock lock];
       internal->executing--;
-      [object removeObserver: self
-		  forKeyPath: @"isFinished"];
-      [self willChangeValueForKey: @"operations"];
-      [self willChangeValueForKey: @"operationCount"];
-      [internal->operations removeObjectIdenticalTo: object];
-      [self didChangeValueForKey: @"operationCount"];
-      [self didChangeValueForKey: @"operations"];
+      [internal->operations removeObjectIdenticalTo:object];
+      [internal->lock unlock];
+      [self didChangeValueForKey:@"operationCount"];
+      [self didChangeValueForKey:@"operations"];
     }
-  else if (YES == [object isReady])
+  else
     {
-      [object removeObserver: self
-		  forKeyPath: @"isReady"];
-      [internal->waiting addObject: object];
+        /* 
+         * If we got up to this point, keyPath equals @"isReady", because
+         * isFinished changes only one way (NO->YES). Now we should check if
+         * this is actually the first change.
+         */
+        BOOL oldValue = [[change valueForKey:NSKeyValueChangeOldKey] boolValue];
+        BOOL newValue = [[change valueForKey:NSKeyValueChangeNewKey] boolValue];
+        if (newValue && !oldValue)
+          {
+            [internal->lock lock];
+            [internal->waiting addObject:object];
+            [internal->lock unlock];
+          }
     }
-  [internal->lock unlock];
+
   [self _execute];
 }
 
@@ -938,8 +779,8 @@ static NSOperationQueue *mainQueue = nil;
       [when release];
       if (NO == found)
 	{
-        [opPool release];
-	  break;	// Idle for 5 seconds ... exit thread.
+          [opPool release];
+	  break; /* idle for 5 seconds, exit thread */
 	}
 
       if ([internal->starting count] > 0)
@@ -954,12 +795,12 @@ static NSOperationQueue *mainQueue = nil;
 
       if ([internal->starting count] > 0)
 	{
-	  // Signal any other idle threads,
+          /* signal any other idle threads */
           [internal->cond unlockWithCondition: 1];
 	}
       else
 	{
-	  // There are no more operations starting.
+	  /* there are no more operations starting */
           [internal->cond unlockWithCondition: 0];
 	}
 
@@ -985,24 +826,25 @@ static NSOperationQueue *mainQueue = nil;
   [NSThread exit];
 }
 
-/* Check for operations which can be executed and start them.
+/* 
+ * Checks for operations which can be executed and starts them
  */
 - (void) _execute
 {
-  NSInteger	max;
-
-  [internal->lock lock];
-
-  max = [self maxConcurrentOperationCount];
+  NSInteger max = [self maxConcurrentOperationCount];
   if (NSOperationQueueDefaultMaxConcurrentOperationCount == max)
     {
       max = maxConcurrent;
     }
 
-  while (NO == [self isSuspended]
-    && max > internal->executing
-    && [internal->waiting count] > 0)
+  for (;;)
     {
+      [internal->lock lock];
+      if (internal->suspended || internal->executing >= max || ![internal->waiting count])
+        {
+          [internal->lock unlock];
+          break;
+        }
       NSOperation	*op;
 
       /* Make sure we have a sorted queue of operations waiting to execute.
@@ -1016,41 +858,40 @@ static NSOperationQueue *mainQueue = nil;
        */
       op = [internal->waiting objectAtIndex: 0];
       [internal->waiting removeObjectAtIndex: 0];
-      [op addObserver: self
-	   forKeyPath: @"isFinished"
-	      options: NSKeyValueObservingOptionNew
-	      context: NULL];
       internal->executing++;
-      if (YES == [op isConcurrent])
+
+      [op addObserver: self
+           forKeyPath: @"isFinished"
+              options: NSKeyValueObservingOptionNew
+              context: NULL];
+
+      if (![op isConcurrent])
 	{
-          [op start];
+          [internal->cond lock];
+          NSUInteger pending = [internal->starting count];
+          [internal->starting addObject: op];
+            
+          /*
+           * Create a new thread if all existing threads are busy and
+           * we haven't reached the pool limit.
+           */
+          if (!internal->threadCount || (pending > 0 && internal->threadCount < POOL))
+	    {
+                internal->threadCount++;
+                [NSThread detachNewThreadSelector: @selector(_thread)
+                                         toTarget: self
+                                       withObject: nil];
+	    }
+          /* tell the thread pool that there is an operation to start */
+          [internal->cond unlockWithCondition: 1];
+          [internal->lock unlock];
 	}
       else
 	{
-	  NSUInteger	pending;
-
-	  [internal->cond lock];
-	  pending = [internal->starting count];
-	  [internal->starting addObject: op];
-
-	  /* Create a new thread if all existing threads are busy and
-	   * we haven't reached the pool limit.
-	   */
-	  if (0 == internal->threadCount
-	    || (pending > 0 && internal->threadCount < POOL))
-	    {
-	      internal->threadCount++;
-	      [NSThread detachNewThreadSelector: @selector(_thread)
-				       toTarget: self
-				     withObject: nil];
-	    }
-	  /* Tell the thread pool that there is an operation to start.
-	   */
-	  [internal->cond unlockWithCondition: 1];
+          [internal->lock unlock];
+          [op start];
 	}
     }
-  [internal->lock unlock];
 }
 
 @end
-
